@@ -14,7 +14,7 @@ def get_conn():
     return conn
 
 
-def init_db(seed_activities: Dict[str, Any] | None = None):
+def init_db(seed_activities: Dict[str, Any] | None = None, admin_password: str | None = None):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -28,9 +28,31 @@ def init_db(seed_activities: Dict[str, Any] | None = None):
         )
         """
     )
+
+    # Auth tables
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password_hash TEXT,
+            is_admin INTEGER DEFAULT 0
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tokens (
+            token TEXT PRIMARY KEY,
+            username TEXT,
+            expires_at TEXT
+        )
+        """
+    )
+
     conn.commit()
 
-    # Seed if provided and table is empty
+    # Seed activities if provided and table is empty
     cur.execute("SELECT COUNT(1) as c FROM activities")
     row = cur.fetchone()
     if seed_activities and row and row["c"] == 0:
@@ -41,7 +63,18 @@ def init_db(seed_activities: Dict[str, Any] | None = None):
             )
         conn.commit()
 
-    conn.close()
+    # Seed admin user if password provided and user doesn't exist
+    if admin_password is not None:
+        cur.execute("SELECT COUNT(1) as c FROM users WHERE username = ?", ("admin",))
+        ur = cur.fetchone()
+        if ur and ur["c"] == 0:
+            import hashlib
++            # simple sha256 hash for prototype (replace with bcrypt in production)
++            pw_hash = hashlib.sha256(admin_password.encode("utf-8")).hexdigest()
++            cur.execute("INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 1)", ("admin", pw_hash))
++            conn.commit()
++
++    conn.close()
 
 
 def get_all_activities():
@@ -59,6 +92,61 @@ def get_all_activities():
         }
     conn.close()
     return result
+
+
+# ------------------- auth helpers -------------------
+import hashlib
+import uuid
+from datetime import datetime, timedelta
+
+
+def create_user_if_missing(username: str, password: str, is_admin: bool = False):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(1) as c FROM users WHERE username = ?", (username,))
+    r = cur.fetchone()
+    if r and r["c"] > 0:
+        conn.close()
+        return
+    pw_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    cur.execute("INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, ?)", (username, pw_hash, 1 if is_admin else 0))
+    conn.commit()
+    conn.close()
+
+
+def authenticate_and_create_token(username: str, password: str, days_valid: int = 7):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+    r = cur.fetchone()
+    if not r:
+        conn.close()
+        return None
+    pw_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    if pw_hash != r["password_hash"]:
+        conn.close()
+        return None
+
+    token = uuid.uuid4().hex
+    expires = (datetime.utcnow() + timedelta(days=days_valid)).isoformat()
+    cur.execute("INSERT INTO tokens (token, username, expires_at) VALUES (?, ?, ?)", (token, username, expires))
+    conn.commit()
+    conn.close()
+    return token
+
+
+def verify_token(token: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT username, expires_at FROM tokens WHERE token = ?", (token,))
+    r = cur.fetchone()
+    conn.close()
+    if not r:
+        return None
+    expires = datetime.fromisoformat(r["expires_at"])
+    if datetime.utcnow() > expires:
+        return None
+    return r["username"]
 
 
 def get_activity(name: str):
